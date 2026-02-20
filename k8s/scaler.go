@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"fmt"
+	"go-controller-agent/dto"
 	"sync"
 	"time"
 
@@ -12,14 +13,16 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-// Scaler handles Kubernetes deployment scaling
+// Scaler handles Kubernetes Deployment scaling operations.
 type Scaler struct {
 	clientset *kubernetes.Clientset
 	logger    logr.Logger
-	mu        sync.Mutex
+
+	// Lock is only needed to avoid concurrent Update races on the same deployment.
+	// Reads are safe without locking.
+	mu sync.Mutex
 }
 
-// NewScaler creates a new scaler
 func NewScaler(clientset *kubernetes.Clientset, logger logr.Logger) *Scaler {
 	return &Scaler{
 		clientset: clientset,
@@ -27,90 +30,86 @@ func NewScaler(clientset *kubernetes.Clientset, logger logr.Logger) *Scaler {
 	}
 }
 
-// ScaleDeployment scales a deployment to the desired replica count
+// ScaleDeployment scales a deployment to the desired replica count.
+// If the deployment is already at desired replicas, it does nothing.
 func (s *Scaler) ScaleDeployment(
 	ctx context.Context,
 	namespace string,
 	name string,
 	desiredReplicas int32,
 ) error {
+	// Read current state (no lock needed for GET)
+	deployment, err := s.GetDeployment(ctx, namespace, name)
+	if err != nil {
+		return err
+	}
+
+	currentReplicas := derefInt32(deployment.Spec.Replicas)
+
+	if currentReplicas == desiredReplicas {
+		s.logger.V(1).Info("No scaling needed",
+			"namespace", namespace,
+			"deployment", name,
+			"current", currentReplicas,
+			"desired", desiredReplicas,
+		)
+		return nil
+	}
+
+	// Lock only for the Update path to avoid concurrent writers
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Get current deployment
-	deployment, err := s.clientset.AppsV1().Deployments(namespace).Get(
+	// Re-fetch latest before updating (avoids updating stale resourceVersion)
+	deployment, err = s.clientset.AppsV1().Deployments(namespace).Get(
 		ctx,
 		name,
 		metav1.GetOptions{},
 	)
 	if err != nil {
-		return fmt.Errorf("failed to get deployment: %w", err)
+		return fmt.Errorf("get deployment for update: %w", err)
 	}
 
-	currentReplicas := int32(0)
-	if deployment.Spec.Replicas != nil {
-		currentReplicas = *deployment.Spec.Replicas
-	}
-
-	// Check if scaling is needed
-	if currentReplicas == desiredReplicas {
-		s.logger.V(1).Info("No scaling needed",
-			"deployment", name,
-			"current", currentReplicas,
-			"desired", desiredReplicas)
-		return nil
-	}
-
-	// Update replica count
 	deployment.Spec.Replicas = &desiredReplicas
 
-	// Apply update
 	updated, err := s.clientset.AppsV1().Deployments(namespace).Update(
 		ctx,
 		deployment,
 		metav1.UpdateOptions{},
 	)
 	if err != nil {
-		return fmt.Errorf("failed to update deployment: %w", err)
+		return fmt.Errorf("update deployment replicas: %w", err)
 	}
 
-	// Verify update
-	if updated.Spec.Replicas == nil || *updated.Spec.Replicas != desiredReplicas {
-		return fmt.Errorf("verification failed: expected %d, got %v",
-			desiredReplicas, updated.Spec.Replicas)
+	got := derefInt32(updated.Spec.Replicas)
+	if got != desiredReplicas {
+		return fmt.Errorf("replica verification failed: expected %d, got %d", desiredReplicas, got)
 	}
 
 	s.logger.Info("✅ Deployment scaled successfully",
+		"namespace", namespace,
 		"deployment", name,
 		"from", currentReplicas,
-		"to", desiredReplicas)
+		"to", desiredReplicas,
+	)
 
 	return nil
 }
 
-// GetCurrentReplicas gets the current replica count
+// GetCurrentReplicas returns the desired replicas configured in spec (not status).
 func (s *Scaler) GetCurrentReplicas(
 	ctx context.Context,
 	namespace string,
 	name string,
 ) (int32, error) {
-	deployment, err := s.clientset.AppsV1().Deployments(namespace).Get(
-		ctx,
-		name,
-		metav1.GetOptions{},
-	)
+	deployment, err := s.GetDeployment(ctx, namespace, name)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get deployment: %w", err)
+		return 0, err
 	}
-
-	if deployment.Spec.Replicas == nil {
-		return 0, nil
-	}
-
-	return *deployment.Spec.Replicas, nil
+	return derefInt32(deployment.Spec.Replicas), nil
 }
 
-// WaitForScale waits for deployment to reach desired replica count
+// WaitForScale waits until AvailableReplicas equals desiredReplicas or timeout occurs.
 func (s *Scaler) WaitForScale(
 	ctx context.Context,
 	namespace string,
@@ -120,42 +119,46 @@ func (s *Scaler) WaitForScale(
 ) error {
 	deadline := time.Now().Add(timeout)
 
-	for time.Now().Before(deadline) {
-		deployment, err := s.clientset.AppsV1().Deployments(namespace).Get(
-			ctx,
-			name,
-			metav1.GetOptions{},
-		)
-		if err != nil {
-			return fmt.Errorf("failed to get deployment: %w", err)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for deployment to scale: %s/%s to %d",
+				namespace, name, desiredReplicas)
 		}
 
-		// Check available replicas
+		deployment, err := s.GetDeployment(ctx, namespace, name)
+		if err != nil {
+			return err
+		}
+
 		if deployment.Status.AvailableReplicas == desiredReplicas {
 			s.logger.Info("✅ Deployment reached desired state",
+				"namespace", namespace,
 				"deployment", name,
-				"replicas", desiredReplicas)
+				"replicas", desiredReplicas,
+			)
 			return nil
 		}
 
 		s.logger.V(1).Info("Waiting for deployment to scale",
+			"namespace", namespace,
 			"deployment", name,
-			"current", deployment.Status.AvailableReplicas,
-			"desired", desiredReplicas)
+			"available", deployment.Status.AvailableReplicas,
+			"desired", desiredReplicas,
+		)
 
-		// Wait before checking again
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(2 * time.Second):
-			// Continue loop
+		case <-ticker.C:
+			// continue
 		}
 	}
-
-	return fmt.Errorf("timeout waiting for deployment to scale")
 }
 
-// GetDeployment retrieves a deployment
+// GetDeployment retrieves the Kubernetes Deployment resource.
 func (s *Scaler) GetDeployment(
 	ctx context.Context,
 	namespace string,
@@ -167,61 +170,39 @@ func (s *Scaler) GetDeployment(
 		metav1.GetOptions{},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get deployment: %w", err)
+		return nil, fmt.Errorf("get deployment %s/%s: %w", namespace, name, err)
 	}
-
 	return deployment, nil
 }
 
-// GetDeploymentStatus returns detailed status information
+// GetDeploymentStatus returns a DTO containing detailed deployment status.
 func (s *Scaler) GetDeploymentStatus(
 	ctx context.Context,
 	namespace string,
 	name string,
-) (*DeploymentStatus, error) {
+) (*dto.DeploymentStatus, error) {
 	deployment, err := s.GetDeployment(ctx, namespace, name)
 	if err != nil {
 		return nil, err
 	}
 
-	status := &DeploymentStatus{
-		Name:               deployment.Name,
-		Namespace:          deployment.Namespace,
-		DesiredReplicas:    int32(0),
-		CurrentReplicas:    deployment.Status.Replicas,
-		AvailableReplicas:  deployment.Status.AvailableReplicas,
+	status := &dto.DeploymentStatus{
+		Name:                deployment.Name,
+		Namespace:           deployment.Namespace,
+		DesiredReplicas:     derefInt32(deployment.Spec.Replicas),
+		CurrentReplicas:     deployment.Status.Replicas,
+		AvailableReplicas:   deployment.Status.AvailableReplicas,
 		UnavailableReplicas: deployment.Status.UnavailableReplicas,
-		UpdatedReplicas:    deployment.Status.UpdatedReplicas,
-		ReadyReplicas:      deployment.Status.ReadyReplicas,
-	}
-
-	if deployment.Spec.Replicas != nil {
-		status.DesiredReplicas = *deployment.Spec.Replicas
+		UpdatedReplicas:     deployment.Status.UpdatedReplicas,
+		ReadyReplicas:       deployment.Status.ReadyReplicas,
 	}
 
 	return status, nil
 }
 
-// DeploymentStatus contains deployment status information
-type DeploymentStatus struct {
-	Name                string
-	Namespace           string
-	DesiredReplicas     int32
-	CurrentReplicas     int32
-	AvailableReplicas   int32
-	UnavailableReplicas int32
-	UpdatedReplicas     int32
-	ReadyReplicas       int32
-}
-
-// IsHealthy checks if deployment is healthy
-func (ds *DeploymentStatus) IsHealthy() bool {
-	return ds.DesiredReplicas == ds.AvailableReplicas &&
-		ds.UnavailableReplicas == 0
-}
-
-// IsScaling checks if deployment is currently scaling
-func (ds *DeploymentStatus) IsScaling() bool {
-	return ds.CurrentReplicas != ds.DesiredReplicas ||
-		ds.UpdatedReplicas != ds.DesiredReplicas
+func derefInt32(v *int32) int32 {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
