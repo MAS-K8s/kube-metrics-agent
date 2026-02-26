@@ -3,206 +3,133 @@ package k8s
 import (
 	"context"
 	"fmt"
-	"go-controller-agent/dto"
-	"sync"
 	"time"
+
+	"go-controller-agent/dto"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 )
 
-// Scaler handles Kubernetes Deployment scaling operations.
 type Scaler struct {
 	clientset *kubernetes.Clientset
 	logger    logr.Logger
-
-	// Lock is only needed to avoid concurrent Update races on the same deployment.
-	// Reads are safe without locking.
-	mu sync.Mutex
 }
+
 
 func NewScaler(clientset *kubernetes.Clientset, logger logr.Logger) *Scaler {
-	return &Scaler{
-		clientset: clientset,
-		logger:    logger,
-	}
+	return &Scaler{clientset: clientset, logger: logger}
 }
 
-// ScaleDeployment scales a deployment to the desired replica count.
-// If the deployment is already at desired replicas, it does nothing.
-func (s *Scaler) ScaleDeployment(
-	ctx context.Context,
-	namespace string,
-	name string,
-	desiredReplicas int32,
-) error {
-	// Read current state (no lock needed for GET)
-	deployment, err := s.GetDeployment(ctx, namespace, name)
-	if err != nil {
-		return err
-	}
-
-	currentReplicas := derefInt32(deployment.Spec.Replicas)
-
-	if currentReplicas == desiredReplicas {
-		s.logger.V(1).Info("No scaling needed",
-			"namespace", namespace,
-			"deployment", name,
-			"current", currentReplicas,
-			"desired", desiredReplicas,
-		)
-		return nil
-	}
-
-	// Lock only for the Update path to avoid concurrent writers
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Re-fetch latest before updating (avoids updating stale resourceVersion)
-	deployment, err = s.clientset.AppsV1().Deployments(namespace).Get(
-		ctx,
-		name,
-		metav1.GetOptions{},
-	)
-	if err != nil {
-		return fmt.Errorf("get deployment for update: %w", err)
-	}
-
-	deployment.Spec.Replicas = &desiredReplicas
-
-	updated, err := s.clientset.AppsV1().Deployments(namespace).Update(
-		ctx,
-		deployment,
-		metav1.UpdateOptions{},
-	)
-	if err != nil {
-		return fmt.Errorf("update deployment replicas: %w", err)
-	}
-
-	got := derefInt32(updated.Spec.Replicas)
-	if got != desiredReplicas {
-		return fmt.Errorf("replica verification failed: expected %d, got %d", desiredReplicas, got)
-	}
-
-	s.logger.Info("✅ Deployment scaled successfully",
-		"namespace", namespace,
-		"deployment", name,
-		"from", currentReplicas,
-		"to", desiredReplicas,
-	)
-
-	return nil
+// ✅ Allows main.go to pass clientset into collector
+func (s *Scaler) Clientset() *kubernetes.Clientset {
+	return s.clientset
 }
 
-// GetCurrentReplicas returns the desired replicas configured in spec (not status).
-func (s *Scaler) GetCurrentReplicas(
-	ctx context.Context,
-	namespace string,
-	name string,
-) (int32, error) {
-	deployment, err := s.GetDeployment(ctx, namespace, name)
+// ListDeploymentsBySelector:
+// - if namespace == "" => list across ALL namespaces
+// - else list within one namespace
+func (s *Scaler) ListDeploymentsBySelector(ctx context.Context, namespace, selector string) ([]appsv1.Deployment, error) {
+	ns := namespace
+	// client-go convention: empty namespace means "all namespaces" for List.
+	list, err := s.clientset.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
 	if err != nil {
-		return 0, err
+		return nil, fmt.Errorf("list deployments selector=%q namespace=%q: %w", selector, namespace, err)
 	}
-	return derefInt32(deployment.Spec.Replicas), nil
+	return list.Items, nil
 }
 
-// WaitForScale waits until AvailableReplicas equals desiredReplicas or timeout occurs.
-func (s *Scaler) WaitForScale(
-	ctx context.Context,
-	namespace string,
-	name string,
-	desiredReplicas int32,
-	timeout time.Duration,
-) error {
-	deadline := time.Now().Add(timeout)
-
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout waiting for deployment to scale: %s/%s to %d",
-				namespace, name, desiredReplicas)
-		}
-
-		deployment, err := s.GetDeployment(ctx, namespace, name)
-		if err != nil {
-			return err
-		}
-
-		if deployment.Status.AvailableReplicas == desiredReplicas {
-			s.logger.Info("✅ Deployment reached desired state",
-				"namespace", namespace,
-				"deployment", name,
-				"replicas", desiredReplicas,
-			)
-			return nil
-		}
-
-		s.logger.V(1).Info("Waiting for deployment to scale",
-			"namespace", namespace,
-			"deployment", name,
-			"available", deployment.Status.AvailableReplicas,
-			"desired", desiredReplicas,
-		)
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			// continue
-		}
-	}
-}
-
-// GetDeployment retrieves the Kubernetes Deployment resource.
-func (s *Scaler) GetDeployment(
-	ctx context.Context,
-	namespace string,
-	name string,
-) (*appsv1.Deployment, error) {
-	deployment, err := s.clientset.AppsV1().Deployments(namespace).Get(
-		ctx,
-		name,
-		metav1.GetOptions{},
-	)
+func (s *Scaler) GetDeployment(ctx context.Context, namespace, name string) (*appsv1.Deployment, error) {
+	dep, err := s.clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("get deployment %s/%s: %w", namespace, name, err)
 	}
-	return deployment, nil
+	return dep, nil
 }
 
-// GetDeploymentStatus returns a DTO containing detailed deployment status.
-func (s *Scaler) GetDeploymentStatus(
-	ctx context.Context,
-	namespace string,
-	name string,
-) (*dto.DeploymentStatus, error) {
-	deployment, err := s.GetDeployment(ctx, namespace, name)
+func PodLabelSelectorFromDeployment(dep *appsv1.Deployment) (string, error) {
+	if dep == nil || dep.Spec.Selector == nil {
+		return "", fmt.Errorf("deployment selector is nil")
+	}
+	ls := labels.Set(dep.Spec.Selector.MatchLabels).String()
+	if ls == "" {
+		return "", fmt.Errorf("deployment selector matchLabels empty")
+	}
+	return ls, nil
+}
+
+func (s *Scaler) GetDeploymentStatus(ctx context.Context, namespace, name string) (*dto.DeploymentStatus, error) {
+	dep, err := s.GetDeployment(ctx, namespace, name)
 	if err != nil {
 		return nil, err
 	}
 
 	status := &dto.DeploymentStatus{
-		Name:                deployment.Name,
-		Namespace:           deployment.Namespace,
-		DesiredReplicas:     derefInt32(deployment.Spec.Replicas),
-		CurrentReplicas:     deployment.Status.Replicas,
-		AvailableReplicas:   deployment.Status.AvailableReplicas,
-		UnavailableReplicas: deployment.Status.UnavailableReplicas,
-		UpdatedReplicas:     deployment.Status.UpdatedReplicas,
-		ReadyReplicas:       deployment.Status.ReadyReplicas,
+		Name:                dep.Name,
+		Namespace:           dep.Namespace,
+		CurrentReplicas:     dep.Status.Replicas,
+		AvailableReplicas:   dep.Status.AvailableReplicas,
+		UnavailableReplicas: dep.Status.UnavailableReplicas,
+		UpdatedReplicas:     dep.Status.UpdatedReplicas,
+		ReadyReplicas:       dep.Status.ReadyReplicas,
 	}
 
+	if dep.Spec.Replicas != nil {
+		status.DesiredReplicas = *dep.Spec.Replicas
+	}
 	return status, nil
 }
 
-func derefInt32(v *int32) int32 {
-	if v == nil {
-		return 0
+func (s *Scaler) ScaleDeployment(ctx context.Context, namespace, name string, desired int32) error {
+	backoff := wait.Backoff{
+		Steps:    4,
+		Duration: 150 * time.Millisecond,
+		Factor:   1.8,
+		Jitter:   0.1,
 	}
-	return *v
+
+	var lastErr error
+	err := wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
+		dep, err := s.clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, err
+			}
+			lastErr = err
+			return false, nil
+		}
+
+		cur := int32(0)
+		if dep.Spec.Replicas != nil {
+			cur = *dep.Spec.Replicas
+		}
+		if cur == desired {
+			return true, nil
+		}
+
+		dep.Spec.Replicas = &desired
+		_, err = s.clientset.AppsV1().Deployments(namespace).Update(ctx, dep, metav1.UpdateOptions{})
+		if err != nil {
+			lastErr = err
+			return false, nil
+		}
+
+		s.logger.Info("✅ Scaled deployment", "namespace", namespace, "deployment", name, "from", cur, "to", desired)
+		return true, nil
+	})
+
+	if err != nil {
+		if lastErr != nil {
+			return fmt.Errorf("scale deployment %s/%s to %d failed: %w", namespace, name, desired, lastErr)
+		}
+		return fmt.Errorf("scale deployment %s/%s to %d failed: %w", namespace, name, desired, err)
+	}
+	return nil
 }
