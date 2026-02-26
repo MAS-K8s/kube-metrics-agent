@@ -1,133 +1,241 @@
 package config
 
 import (
+	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 )
 
-// Config holds all configuration for the controller
 type Config struct {
-	// Kubernetes settings
-	Namespace  string
-	Deployment string
+	// Watch scope ("" = all namespaces)
+	Namespace     string
+	LabelSelector string
 
-	// External services
+	// External endpoints (use in-cluster DNS names in K8s)
 	PrometheusURL string
 	RLAgentURL    string
 
-	// Controller settings
-	Interval       time.Duration
-	MinReplicas    int32
-	MaxReplicas    int32
-	TrainingMode   bool
-	MockMode       bool
-	SafetyEnabled  bool
-	MaxScalePerMin int32
+	// Loop
+	Interval time.Duration
 
-	// Model settings
-	ModelPath string
+	// Scaling policy
+	MinReplicas   int32
+	MaxReplicas   int32
+	MaxScaleStep  int32
+	Cooldown      time.Duration
+	ConfidenceMin float64
+
+	// Modes
+	TrainingMode bool
+	MockMode     bool
+
+	// Timeouts
+	PrometheusTimeout time.Duration
+	RLAgentTimeout    time.Duration
+	K8sTimeout        time.Duration
+
+	// Retry/backoff
+	RetryMaxAttempts int
+	RetryBaseDelay   time.Duration
+	RetryMaxDelay    time.Duration
+
+	// Circuit breaker
+	CBFailureThreshold int
+	CBOpenDuration     time.Duration
+
+	// Concurrency
+	MaxConcurrent int
 }
 
-// Validate checks if configuration is valid
-func (c *Config) Validate() error {
-	if c.Namespace == "" {
-		return fmt.Errorf("namespace cannot be empty")
+// Load is “production first”:
+// - env vars are the main config (K8s style)
+// - flags exist ONLY to override for local dev
+func Load() (Config, error) {
+	cfg := Config{
+		Namespace:     getenv("NAMESPACE", ""), // "" => all namespaces
+		LabelSelector: getenv("LABEL_SELECTOR", "rl-autoscale=true"),
+
+		PrometheusURL: mustGetenv("PROMETHEUS_URL"), // require in prod
+		RLAgentURL:    mustGetenv("RL_AGENT_URL"),   // require in prod
+
+		Interval: mustDuration(getenv("INTERVAL", "30s")),
+
+		MinReplicas:  int32(mustInt(getenv("MIN_REPLICAS", "1"))),
+		MaxReplicas:  int32(mustInt(getenv("MAX_REPLICAS", "10"))),
+		MaxScaleStep: int32(mustInt(getenv("MAX_SCALE_STEP", "1"))),
+
+		Cooldown:      mustDuration(getenv("COOLDOWN", "60s")),
+		ConfidenceMin: mustFloat(getenv("CONFIDENCE_MIN", "0.60")),
+
+		TrainingMode: mustBool(getenv("TRAINING_MODE", "true")),
+		MockMode:     mustBool(getenv("MOCK_MODE", "false")),
+
+		PrometheusTimeout: mustDuration(getenv("PROM_TIMEOUT", "3s")),
+		RLAgentTimeout:    mustDuration(getenv("RL_TIMEOUT", "2s")),
+		K8sTimeout:        mustDuration(getenv("K8S_TIMEOUT", "5s")),
+
+		RetryMaxAttempts: mustInt(getenv("RETRY_MAX_ATTEMPTS", "3")),
+		RetryBaseDelay:   mustDuration(getenv("RETRY_BASE_DELAY", "250ms")),
+		RetryMaxDelay:    mustDuration(getenv("RETRY_MAX_DELAY", "3s")),
+
+		CBFailureThreshold: mustInt(getenv("CB_FAILURE_THRESHOLD", "5")),
+		CBOpenDuration:     mustDuration(getenv("CB_OPEN_DURATION", "30s")),
+
+		MaxConcurrent: mustInt(getenv("MAX_CONCURRENT", "4")),
 	}
 
-	if c.Deployment == "" {
-		return fmt.Errorf("deployment cannot be empty")
+	// Optional: allow CLI overrides (local dev)
+	// In Kubernetes you normally won’t pass flags, so this won’t conflict.
+	applyFlagOverrides(&cfg)
+
+	if err := validate(cfg); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+func applyFlagOverrides(cfg *Config) {
+	// NOTE: only use these when you intentionally pass flags.
+	var (
+		ns          = flag.String("namespace", "", "Override namespace (empty=all)")
+		selector    = flag.String("selector", "", "Override label selector")
+		prom        = flag.String("prometheus", "", "Override Prometheus URL")
+		rl          = flag.String("rl-agent", "", "Override RL Agent URL")
+		intervalStr = flag.String("interval", "", "Override interval, e.g. 30s")
+
+		minRep  = flag.Int("min-replicas", -1, "Override min replicas")
+		maxRep  = flag.Int("max-replicas", -1, "Override max replicas")
+		step    = flag.Int("max-scale-step", -1, "Override max scale step")
+		coolStr = flag.String("cooldown", "", "Override cooldown, e.g. 60s")
+
+		conf = flag.Float64("confidence-min", -1, "Override confidence min 0..1")
+		mock = flag.Bool("mock", cfg.MockMode, "Override mock mode")
+		train = flag.Bool("training", cfg.TrainingMode, "Override training mode")
+	)
+
+	flag.Parse()
+
+	if *ns != "" || flag.Lookup("namespace").Value.String() == "" {
+		// If user passed -namespace explicitly (even empty), accept it:
+		if flagIsSet("namespace") {
+			cfg.Namespace = *ns
+		}
+	}
+	if flagIsSet("selector") && *selector != "" {
+		cfg.LabelSelector = *selector
+	}
+	if flagIsSet("prometheus") && *prom != "" {
+		cfg.PrometheusURL = *prom
+	}
+	if flagIsSet("rl-agent") && *rl != "" {
+		cfg.RLAgentURL = *rl
+	}
+	if flagIsSet("interval") && *intervalStr != "" {
+		cfg.Interval = mustDuration(*intervalStr)
+	}
+	if flagIsSet("min-replicas") && *minRep >= 0 {
+		cfg.MinReplicas = int32(*minRep)
+	}
+	if flagIsSet("max-replicas") && *maxRep >= 0 {
+		cfg.MaxReplicas = int32(*maxRep)
+	}
+	if flagIsSet("max-scale-step") && *step >= 0 {
+		cfg.MaxScaleStep = int32(*step)
+	}
+	if flagIsSet("cooldown") && *coolStr != "" {
+		cfg.Cooldown = mustDuration(*coolStr)
+	}
+	if flagIsSet("confidence-min") && *conf >= 0 {
+		cfg.ConfidenceMin = *conf
 	}
 
+	// bool flags always have a value, so we only set if flag explicitly provided
+	if flagIsSet("mock") {
+		cfg.MockMode = *mock
+	}
+	if flagIsSet("training") {
+		cfg.TrainingMode = *train
+	}
+}
+
+func flagIsSet(name string) bool {
+	f := flag.Lookup(name)
+	return f != nil && f.Value.String() != f.DefValue
+}
+
+func validate(c Config) error {
+	if c.LabelSelector == "" {
+		return fmt.Errorf("LABEL_SELECTOR cannot be empty")
+	}
+	if c.PrometheusURL == "" {
+		return fmt.Errorf("PROMETHEUS_URL is required (set it as env in Kubernetes)")
+	}
 	if c.RLAgentURL == "" {
-		return fmt.Errorf("RL agent URL cannot be empty")
+		return fmt.Errorf("RL_AGENT_URL is required (set it as env in Kubernetes)")
 	}
-
 	if c.MinReplicas < 1 {
-		return fmt.Errorf("min replicas must be >= 1, got %d", c.MinReplicas)
+		return fmt.Errorf("MIN_REPLICAS must be >= 1")
 	}
-
 	if c.MaxReplicas < c.MinReplicas {
-		return fmt.Errorf("max replicas (%d) must be >= min replicas (%d)",
-			c.MaxReplicas, c.MinReplicas)
+		return fmt.Errorf("MAX_REPLICAS must be >= MIN_REPLICAS")
 	}
-
-	if c.Interval < 10*time.Second {
-		return fmt.Errorf("interval must be >= 10s, got %s", c.Interval)
+	if c.MaxScaleStep < 1 {
+		return fmt.Errorf("MAX_SCALE_STEP must be >= 1")
 	}
-
-	if c.MaxScalePerMin < 1 {
-		return fmt.Errorf("max scale per minute must be >= 1, got %d", c.MaxScalePerMin)
+	if c.Interval < 5*time.Second {
+		return fmt.Errorf("INTERVAL must be >= 5s")
 	}
-
+	if c.ConfidenceMin < 0 || c.ConfidenceMin > 1 {
+		return fmt.Errorf("CONFIDENCE_MIN must be between 0 and 1")
+	}
 	return nil
 }
 
-// LoadFromEnv loads configuration from environment variables
-func LoadFromEnv() *Config {
-	return &Config{
-		Namespace:      getEnv("NAMESPACE", "default"),
-		Deployment:     getEnv("DEPLOYMENT", "myapp"),
-		PrometheusURL:  getEnv("PROMETHEUS_URL", "http://prometheus:9090"),
-		RLAgentURL:     getEnv("RL_AGENT_URL", "http://rl-agent-service:5000"),
-		Interval:       getDurationEnv("INTERVAL", 30*time.Second),
-		MinReplicas:    int32(getIntEnv("MIN_REPLICAS", 1)),
-		MaxReplicas:    int32(getIntEnv("MAX_REPLICAS", 10)),
-		TrainingMode:   getBoolEnv("TRAINING_MODE", true),
-		MockMode:       getBoolEnv("MOCK_MODE", false),
-		SafetyEnabled:  getBoolEnv("SAFETY_ENABLED", true),
-		MaxScalePerMin: int32(getIntEnv("MAX_SCALE_PER_MIN", 3)),
-		ModelPath:      getEnv("MODEL_PATH", "./models/rl_model.pt"),
+// -------- env helpers --------
+
+func getenv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
+	return def
 }
 
-// getEnv gets an environment variable with a default value
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
+func mustGetenv(key string) string {
+	v := os.Getenv(key)
+	// allow empty during local dev if you want, but in prod validation will fail
+	return v
 }
 
-// getIntEnv gets an integer environment variable with a default
-func getIntEnv(key string, defaultValue int) int {
-	if value := os.Getenv(key); value != "" {
-		var intValue int
-		if _, err := fmt.Sscanf(value, "%d", &intValue); err == nil {
-			return intValue
-		}
+func mustInt(s string) int {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		panic(fmt.Sprintf("invalid int: %q", s))
 	}
-	return defaultValue
+	return n
 }
 
-// getBoolEnv gets a boolean environment variable with a default
-func getBoolEnv(key string, defaultValue bool) bool {
-	if value := os.Getenv(key); value != "" {
-		return value == "true" || value == "1" || value == "yes"
+func mustFloat(s string) float64 {
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		panic(fmt.Sprintf("invalid float: %q", s))
 	}
-	return defaultValue
+	return f
 }
 
-// getDurationEnv gets a duration environment variable with a default
-func getDurationEnv(key string, defaultValue time.Duration) time.Duration {
-	if value := os.Getenv(key); value != "" {
-		if duration, err := time.ParseDuration(value); err == nil {
-			return duration
-		}
+func mustBool(s string) bool {
+	b, err := strconv.ParseBool(s)
+	if err != nil {
+		panic(fmt.Sprintf("invalid bool: %q", s))
 	}
-	return defaultValue
+	return b
 }
 
-// String returns a string representation of the config
-func (c *Config) String() string {
-	return fmt.Sprintf(
-		"Config{Namespace:%s, Deployment:%s, Interval:%s, MinReplicas:%d, MaxReplicas:%d, TrainingMode:%t, MockMode:%t}",
-		c.Namespace,
-		c.Deployment,
-		c.Interval,
-		c.MinReplicas,
-		c.MaxReplicas,
-		c.TrainingMode,
-		c.MockMode,
-	)
+func mustDuration(s string) time.Duration {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		panic(fmt.Sprintf("invalid duration: %q", s))
+	}
+	return d
 }

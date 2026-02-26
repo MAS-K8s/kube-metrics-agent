@@ -1,10 +1,12 @@
 package k8s
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/kubernetes"
@@ -12,75 +14,61 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-// ClientBuilder helps build Kubernetes clients
 type ClientBuilder struct {
 	logger logr.Logger
 }
 
-// NewClientBuilder creates a new client builder
 func NewClientBuilder(logger logr.Logger) *ClientBuilder {
-	return &ClientBuilder{
-		logger: logger,
-	}
+	return &ClientBuilder{logger: logger}
 }
 
-// Build creates a Kubernetes clientset
 func (cb *ClientBuilder) Build() (*kubernetes.Clientset, error) {
-	config, err := cb.buildConfig()
+	cfg, err := cb.buildConfig()
 	if err != nil {
-		return nil, fmt.Errorf("failed to build config: %w", err)
+		return nil, fmt.Errorf("build kube config: %w", err)
 	}
 
-	clientset, err := kubernetes.NewForConfig(config)
+	cs, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create clientset: %w", err)
+		return nil, fmt.Errorf("create clientset: %w", err)
 	}
 
-	cb.logger.Info("✅ Kubernetes client created successfully")
-	return clientset, nil
+	cb.logger.Info("✅ Kubernetes client created")
+	return cs, nil
 }
 
-// buildConfig creates a Kubernetes client configuration
 func (cb *ClientBuilder) buildConfig() (*rest.Config, error) {
-	// Try in-cluster config first
-	config, err := rest.InClusterConfig()
-	if err == nil {
-		cb.logger.Info("🔗 Using in-cluster Kubernetes configuration")
-		return config, nil
+	// Prefer in-cluster
+	if cfg, err := rest.InClusterConfig(); err == nil {
+		cb.logger.Info("🔗 Using in-cluster Kubernetes config")
+		return cfg, nil
 	}
 
-	// Fall back to kubeconfig
+	// Fallback: kubeconfig
 	kubeconfig := cb.getKubeconfigPath()
 	if kubeconfig == "" {
-		return nil, fmt.Errorf("could not find kubeconfig and not running in-cluster")
+		return nil, fmt.Errorf("not in cluster and kubeconfig not found")
 	}
 
 	cb.logger.Info("⚙️ Using local kubeconfig", "path", kubeconfig)
-	config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
+		return nil, fmt.Errorf("load kubeconfig: %w", err)
 	}
-
-	return config, nil
+	return cfg, nil
 }
 
-// getKubeconfigPath finds the kubeconfig file path
 func (cb *ClientBuilder) getKubeconfigPath() string {
-	// Check KUBECONFIG environment variable
-	if kubeconfig := os.Getenv("KUBECONFIG"); kubeconfig != "" {
-		return kubeconfig
+	if v := os.Getenv("KUBECONFIG"); v != "" {
+		return v
 	}
-
-	// Check default location
 	home := homeDir()
 	if home == "" {
 		return ""
 	}
-
 	return filepath.Join(home, ".kube", "config")
 }
 
-// homeDir gets the user's home directory
 func homeDir() string {
 	if h := os.Getenv("HOME"); h != "" {
 		return h
@@ -97,25 +85,18 @@ type HealthChecker struct {
 	logger    logr.Logger
 }
 
-// NewHealthChecker creates a new health checker
 func NewHealthChecker(clientset *kubernetes.Clientset, logger logr.Logger) *HealthChecker {
-	return &HealthChecker{
-		clientset: clientset,
-		logger:    logger,
-	}
+	return &HealthChecker{clientset: clientset, logger: logger}
 }
 
-// Check verifies Kubernetes API is reachable
-func (hc *HealthChecker) Check() error {
-	// Try to get server version
+func (hc *HealthChecker) Check(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
 	version, err := hc.clientset.Discovery().ServerVersion()
 	if err != nil {
-		return fmt.Errorf("cannot reach Kubernetes API: %w", err)
+		return fmt.Errorf("k8s api unreachable: %w", err)
 	}
-
-	hc.logger.Info("✅ Kubernetes API healthy",
-		"version", version.GitVersion,
-		"platform", version.Platform)
-
+	hc.logger.Info("✅ Kubernetes API healthy", "version", version.GitVersion, "platform", version.Platform)
 	return nil
 }
