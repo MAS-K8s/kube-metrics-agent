@@ -4,760 +4,416 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"flag"
 	"fmt"
-	"go-controller-agent/dto"
 	"io"
-	"math"
-	"math/rand"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"runtime"
 	"sync"
 	"syscall"
 	"time"
 
+	"go-controller-agent/config"
+	"go-controller-agent/dto"
+	"go-controller-agent/k8s"
+	"go-controller-agent/metrics"
+
 	"github.com/go-logr/logr"
 	"github.com/go-logr/zapr"
+	"github.com/joho/godotenv"
 	"go.uber.org/zap"
-	appsv1 "k8s.io/api/apps/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
-
-
-type MetricsHistory struct {
-	mu      sync.RWMutex
-	History []dto.Metrics
-	MaxSize int
+type CircuitBreaker struct {
+	mu               sync.Mutex
+	failures         int
+	openUntil        time.Time
+	failureThreshold int
+	openDuration     time.Duration
 }
 
-func NewMetricsHistory(maxSize int) *MetricsHistory {
-	return &MetricsHistory{
-		History: make([]dto.Metrics, 0, maxSize),
-		MaxSize: maxSize,
-	}
+func NewCircuitBreaker(threshold int, openDuration time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{failureThreshold: threshold, openDuration: openDuration}
 }
-
-func (mh *MetricsHistory) Add(m dto.Metrics) {
-	mh.mu.Lock()
-	defer mh.mu.Unlock()
-
-	mh.History = append(mh.History, m)
-	if len(mh.History) > mh.MaxSize {
-		mh.History = mh.History[1:]
-	}
+func (cb *CircuitBreaker) Allow() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	return !time.Now().Before(cb.openUntil)
 }
-
-func (mh *MetricsHistory) GetRecent(n int) []dto.Metrics {
-	mh.mu.RLock()
-	defer mh.mu.RUnlock()
-
-	if n <= 0 || len(mh.History) == 0 {
-		return nil
-	}
-	if len(mh.History) < n {
-		out := make([]dto.Metrics, len(mh.History))
-		copy(out, mh.History)
-		return out
-	}
-	out := make([]dto.Metrics, n)
-	copy(out, mh.History[len(mh.History)-n:])
-	return out
+func (cb *CircuitBreaker) Success() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures = 0
+	cb.openUntil = time.Time{}
 }
-
-func (mh *MetricsHistory) CalculateTrends() (cpu1m, cpu5m, requestTrend float64) {
-	recent := mh.GetRecent(10)
-	if len(recent) < 2 {
-		return 0, 0, 0
-	}
-
-	cpu1m = recent[len(recent)-1].CPUUsage - recent[len(recent)-2].CPUUsage
-	requestTrend = recent[len(recent)-1].RequestRate - recent[len(recent)-2].RequestRate
-
-	if len(recent) >= 10 {
-		// average delta per sample across last 10 samples
-		cpu5m = (recent[len(recent)-1].CPUUsage - recent[0].CPUUsage) / float64(len(recent))
-	}
-	return
-}
-
-type SafetyController struct {
-	mu            sync.Mutex
-	scalingEvents []dto.ScalingEvent
-	maxPerMinute  int32
-}
-
-func NewSafetyController(maxPerMinute int32) *SafetyController {
-	return &SafetyController{
-		scalingEvents: make([]dto.ScalingEvent, 0, 32),
-		maxPerMinute:  maxPerMinute,
+func (cb *CircuitBreaker) Fail() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures++
+	if cb.failures >= cb.failureThreshold {
+		cb.openUntil = time.Now().Add(cb.openDuration)
 	}
 }
 
-func (sc *SafetyController) CanScale(current, desired int32) (bool, string) {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	// Rate limit window
-	cutoff := time.Now().Add(-1 * time.Minute)
-	valid := sc.scalingEvents[:0]
-	for _, e := range sc.scalingEvents {
-		if e.Timestamp.After(cutoff) {
-			valid = append(valid, e)
-		}
-	}
-	sc.scalingEvents = valid
-
-	if int32(len(sc.scalingEvents)) >= sc.maxPerMinute {
-		return false, fmt.Sprintf("rate limit: %d scalings in last minute", len(sc.scalingEvents))
-	}
-
-	// Oscillation detection: look at direction of last 3 actions
-	if len(sc.scalingEvents) >= 3 {
-		last3 := sc.scalingEvents[len(sc.scalingEvents)-3:]
-		if isOscillating(last3) {
-			return false, "oscillation detected, blocking scaling"
-		}
-	}
-
-	// Clamp change size
-	delta := int32(math.Abs(float64(desired - current)))
-	if delta > 3 {
-		return false, fmt.Sprintf("change too large: %d replicas", delta)
-	}
-
-	return true, ""
+type cooldownState struct {
+	mu         sync.Mutex
+	lastScaled map[string]time.Time
 }
 
-func (sc *SafetyController) RecordScaling(from, to int32, action, reason string) {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	sc.scalingEvents = append(sc.scalingEvents, dto.ScalingEvent{
-		Timestamp:    time.Now(),
-		FromReplicas: from,
-		ToReplicas:   to,
-		Action:       action,
-		Reason:       reason,
-	})
+func newCooldownState() *cooldownState { return &cooldownState{lastScaled: map[string]time.Time{}} }
+func (cs *cooldownState) CanScale(key string, cooldown time.Duration) bool {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	last, ok := cs.lastScaled[key]
+	if !ok {
+		return true
+	}
+	return time.Since(last) >= cooldown
+}
+func (cs *cooldownState) MarkScaled(key string) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.lastScaled[key] = time.Now()
 }
 
-func isOscillating(events []dto.ScalingEvent) bool {
-	if len(events) < 3 {
-		return false
-	}
-	// Direction is based on each event's own from->to
-	dir := func(e dto.ScalingEvent) int32 { return e.ToReplicas - e.FromReplicas }
-	d1, d2, d3 := dir(events[0]), dir(events[1]), dir(events[2])
-
-	// Up then down OR down then up in consecutive steps (ignore zeros)
-	flip := func(a, b int32) bool {
-		if a == 0 || b == 0 {
-			return false
-		}
-		return (a > 0 && b < 0) || (a < 0 && b > 0)
-	}
-	return flip(d1, d2) || flip(d2, d3)
+type HistoryStore struct {
+	mu   sync.Mutex
+	data map[string]*metrics.History
 }
 
-// ======================== CONTROLLER STRUCT ========================
-
-type Controller struct {
-	cfg       dto.Config
-	log       logr.Logger
-	clientset *kubernetes.Clientset
-	http      *http.Client
-
-	history *MetricsHistory
-	safety  *SafetyController
+func NewHistoryStore() *HistoryStore { return &HistoryStore{data: map[string]*metrics.History{}} }
+func (hs *HistoryStore) Get(ns, name string) *metrics.History {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	key := ns + "/" + name
+	if h, ok := hs.data[key]; ok {
+		return h
+	}
+	h := metrics.NewHistory(120)
+	hs.data[key] = h
+	return h
 }
 
 func main() {
-	cfg, err := parseAndValidateConfig()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "config error:", err)
-		os.Exit(2)
-	}
-
 	zapLog, _ := zap.NewDevelopment()
-	defer func() { _ = zapLog.Sync() }()
-	log := zapr.NewLogger(zapLog)
+	logger := zapr.NewLogger(zapLog)
 
-	log.Info("🚀 Starting Advanced RL Controller",
-		"namespace", cfg.Namespace,
-		"deployment", cfg.Deployment,
-		"training_mode", cfg.TrainingMode,
-		"mock_mode", cfg.MockMode,
-		"prometheus", cfg.PromURL,
-		"rl_agent", cfg.RLAgentURL,
-	)
-
-	clientset, err := buildK8sClient(log)
+	_ = godotenv.Load()
+	cfg, err := config.Load()
 	if err != nil {
-		log.Error(err, "❌ Failed to create Kubernetes client")
+		logger.Error(err, "config invalid")
 		os.Exit(1)
 	}
 
-	c := &Controller{
-		cfg:       cfg,
-		log:       log,
-		clientset: clientset,
-		http: &http.Client{
-			Timeout: 6 * time.Second, // global safety net
-		},
-		history: NewMetricsHistory(100),
-		safety:  NewSafetyController(cfg.MaxScalePerMin),
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	nsInfo := cfg.Namespace
+	if nsInfo == "" {
+		nsInfo = "<ALL>"
 	}
 
-	// Don’t hard-exit if Prometheus/RL is down; keep running and fallback.
-	if !c.cfg.MockMode {
-		if err := c.testPrometheus(); err != nil {
-			c.log.Error(err, "⚠️ Prometheus unavailable; switching to mock metrics")
-			c.cfg.MockMode = true
-		}
-	}
-	if err := c.testRLAgent(); err != nil {
-		c.log.Error(err, "⚠️ RL Agent unavailable; will use fallback until it becomes reachable")
-	}
+	logger.Info("🚀 RL Controller starting",
+		"namespace", nsInfo,
+		"selector", cfg.LabelSelector,
+		"interval", cfg.Interval,
+		"training", cfg.TrainingMode,
+		"mock", cfg.MockMode,
+		"maxConcurrent", cfg.MaxConcurrent,
+	)
 
-	ctx, cancel := signalContext()
-	defer cancel()
-
-	c.run(ctx)
-}
-
-func signalContext() (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
-	ch := make(chan os.Signal, 2)
-	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-ch
-		cancel()
-	}()
-	return ctx, cancel
-}
-
-// ======================== CONFIG ========================
-
-func parseAndValidateConfig() (dto.Config, error) {
-	var cfg dto.Config
-	var minRepl, maxRepl int
-
-	flag.StringVar(&cfg.Namespace, "namespace", "default", "Kubernetes namespace")
-	flag.StringVar(&cfg.Deployment, "deployment", "myapp", "Deployment name")
-	flag.StringVar(&cfg.PromURL, "prometheus", "http://34.19.119.245:30457", "Prometheus base URL (no trailing /api)")
-	flag.StringVar(&cfg.RLAgentURL, "rl-agent", "http://localhost:5000", "RL Agent base URL")
-	flag.DurationVar(&cfg.Interval, "interval", 30*time.Second, "Polling interval")
-	flag.IntVar(&minRepl, "min-replicas", 1, "Minimum replicas")
-	flag.IntVar(&maxRepl, "max-replicas", 10, "Maximum replicas")
-	flag.BoolVar(&cfg.TrainingMode, "training", true, "Enable training mode")
-	flag.BoolVar(&cfg.MockMode, "mock", false, "Use mock metrics")
-	flag.BoolVar(&cfg.SafetyEnabled, "safety", true, "Enable safety controls")
-	flag.StringVar(&cfg.ModelPath, "model-path", "./models/rl_model.pt", "Model path")
-	flag.Parse()
-
-	cfg.MinReplicas = int32(minRepl)
-	cfg.MaxReplicas = int32(maxRepl)
-	cfg.MaxScalePerMin = 3
-
-	if cfg.Namespace == "" || cfg.Deployment == "" {
-		return cfg, errors.New("namespace and deployment must not be empty")
-	}
-	if cfg.MinReplicas < 1 || cfg.MaxReplicas < cfg.MinReplicas {
-		return cfg, fmt.Errorf("invalid replicas range: min=%d max=%d", cfg.MinReplicas, cfg.MaxReplicas)
-	}
-	if cfg.Interval < 5*time.Second {
-		return cfg, fmt.Errorf("interval too small (%s). use >= 5s", cfg.Interval)
-	}
-
-	// ✅ FIX: validate URLs (catches htttp://)
-	if err := validateBaseURL(cfg.PromURL); err != nil {
-		return cfg, fmt.Errorf("invalid prometheus url: %w", err)
-	}
-	if err := validateBaseURL(cfg.RLAgentURL); err != nil {
-		return cfg, fmt.Errorf("invalid rl-agent url: %w", err)
-	}
-
-	return cfg, nil
-}
-
-func validateBaseURL(raw string) error {
-	u, err := url.ParseRequestURI(raw)
+	clientset, err := k8s.NewClientBuilder(logger).Build()
 	if err != nil {
-		return err
+		logger.Error(err, "k8s client build failed")
+		os.Exit(1)
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("scheme must be http/https, got %q", u.Scheme)
+	if err := k8s.NewHealthChecker(clientset, logger).Check(ctx); err != nil {
+		logger.Error(err, "k8s health check failed")
+		os.Exit(1)
 	}
-	if u.Host == "" {
-		return errors.New("missing host")
-	}
-	return nil
-}
 
-// ======================== RUN LOOP ========================
+	scaler := k8s.NewScaler(clientset, logger)
+	validator := metrics.NewValidator()
+	historyStore := NewHistoryStore()
 
-func (c *Controller) run(ctx context.Context) {
-	ticker := time.NewTicker(c.cfg.Interval)
+	collector := metrics.NewCollector(
+		cfg.PrometheusURL,
+		cfg.MockMode,
+		cfg.PrometheusTimeout,
+		cfg.RetryMaxAttempts,
+		cfg.RetryBaseDelay,
+		cfg.RetryMaxDelay,
+		logger,
+	)
+
+	httpClient := &http.Client{Timeout: cfg.RLAgentTimeout}
+	rlCB := NewCircuitBreaker(cfg.CBFailureThreshold, cfg.CBOpenDuration)
+	cd := newCooldownState()
+	sem := make(chan struct{}, cfg.MaxConcurrent)
+
+	checkStartup(ctx, cfg, logger, httpClient, collector)
+
+	_ = runOnce(ctx, cfg, logger, scaler, collector, validator, historyStore, httpClient, rlCB, cd, sem)
+
+	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
-
-	c.log.Info("✅ Controller started", "interval", c.cfg.Interval.String())
-
-	// run immediately once
-	_ = c.reconcileOnce(ctx)
 
 	for {
 		select {
 		case <-ctx.Done():
-			c.log.Info("🛑 Shutting down controller")
+			logger.Info("🛑 Shutdown requested")
 			return
 		case <-ticker.C:
-			if err := c.reconcileOnce(ctx); err != nil {
-				c.log.Error(err, "⚠️ Reconcile failed")
-			}
+			_ = runOnce(ctx, cfg, logger, scaler, collector, validator, historyStore, httpClient, rlCB, cd, sem)
 		}
 	}
 }
 
-func (c *Controller) reconcileOnce(ctx context.Context) error {
-	// per-iteration timeout (prevents hanging)
-	iterCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+func checkStartup(ctx context.Context, cfg config.Config, logger logr.Logger, httpClient *http.Client, collector *metrics.Collector) {
+	if err := checkRLHealth(ctx, cfg, httpClient); err != nil {
+		logger.Error(err, "⚠️ RL Agent health check failed")
+	} else {
+		logger.Info("✅ RL Agent health check OK")
+	}
+
+	if !cfg.MockMode {
+		if err := collector.CheckPrometheus(ctx); err != nil {
+			logger.Error(err, "⚠️ Prometheus health check failed (metrics may be unavailable)")
+		} else {
+			logger.Info("✅ Prometheus health check OK")
+		}
+	} else {
+		logger.Info("ℹ️ MockMode enabled, skipping Prometheus health check")
+	}
+}
+
+func checkRLHealth(ctx context.Context, cfg config.Config, httpClient *http.Client) error {
+	hctx, cancel := context.WithTimeout(ctx, cfg.RLAgentTimeout)
 	defer cancel()
 
-	deploy, err := c.clientset.AppsV1().Deployments(c.cfg.Namespace).Get(iterCtx, c.cfg.Deployment, metav1.GetOptions{})
+	req, err := http.NewRequestWithContext(hctx, http.MethodGet, cfg.RLAgentURL+"/health", nil)
+	if err != nil {
+		return fmt.Errorf("create health request: %w", err)
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("rl agent not reachable: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("rl health status=%d body=%s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+func runOnce(
+	ctx context.Context,
+	cfg config.Config,
+	logger logr.Logger,
+	scaler *k8s.Scaler,
+	collector *metrics.Collector,
+	validator *metrics.Validator,
+	historyStore *HistoryStore,
+	httpClient *http.Client,
+	rlCB *CircuitBreaker,
+	cd *cooldownState,
+	sem chan struct{},
+) error {
+	k8sCtx, cancel := context.WithTimeout(ctx, cfg.K8sTimeout)
+	defer cancel()
+
+	deployments, err := scaler.ListDeploymentsBySelector(k8sCtx, cfg.Namespace, cfg.LabelSelector)
+	if err != nil {
+		logger.Error(err, "list deployments failed", "namespace", cfg.Namespace, "selector", cfg.LabelSelector)
+		return nil
+	}
+
+	if len(deployments) == 0 {
+		nsInfo := cfg.Namespace
+		if nsInfo == "" {
+			nsInfo = "<ALL>"
+		}
+		logger.V(1).Info("no deployments matched selector", "namespace", nsInfo, "selector", cfg.LabelSelector)
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	for _, dep := range deployments {
+		dep := dep
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			reconcileCtx, cancel := context.WithTimeout(ctx, cfg.Interval)
+			defer cancel()
+
+			if err := reconcileOne(reconcileCtx, cfg, logger, scaler, collector, validator, historyStore, httpClient, rlCB, cd, dep.Namespace, dep.Name); err != nil {
+				logger.Error(err, "reconcile failed", "namespace", dep.Namespace, "deployment", dep.Name)
+			}
+		}()
+	}
+	wg.Wait()
+	return nil
+}
+
+func reconcileOne(
+	ctx context.Context,
+	cfg config.Config,
+	logger logr.Logger,
+	scaler *k8s.Scaler,
+	collector *metrics.Collector,
+	validator *metrics.Validator,
+	historyStore *HistoryStore,
+	httpClient *http.Client,
+	rlCB *CircuitBreaker,
+	cd *cooldownState,
+	namespace, name string,
+) error {
+	k8sCtx, cancel := context.WithTimeout(ctx, cfg.K8sTimeout)
+	defer cancel()
+
+	dep, err := scaler.GetDeployment(k8sCtx, namespace, name)
 	if err != nil {
 		return fmt.Errorf("get deployment: %w", err)
 	}
 
-	metrics, err := c.collectMetrics(iterCtx, deploy)
+	hist := historyStore.Get(namespace, name)
+
+	// ✅ If Prometheus fails: LOG and skip scaling (controller continues)
+	m, err := collector.Collect(ctx, scaler.Clientset(), namespace, name, dep, hist)
 	if err != nil {
-		return fmt.Errorf("collect metrics: %w", err)
-	}
-
-	c.history.Add(metrics)
-
-	c.log.Info("📊 Metrics Collected",
-		"cpu", fmt.Sprintf("%.3f", metrics.CPUUsage),
-		"memory", fmt.Sprintf("%.2f GB", metrics.MemoryUsage),
-		"requests/s", fmt.Sprintf("%.1f", metrics.RequestRate),
-		"p95_latency", fmt.Sprintf("%.3fs", metrics.LatencyP95),
-		"replicas", metrics.Replicas,
-		"ready", metrics.PodReady,
-		"pending", metrics.PodPending,
-		"error_rate", fmt.Sprintf("%.4f", metrics.ErrorRate),
-	)
-
-	rlResp, err := c.queryRLAgent(iterCtx, metrics)
-	if err != nil {
-		c.log.Error(err, "⚠️ RL Agent call failed; using fallback")
-		return c.fallbackScaling(iterCtx, metrics, deploy)
-	}
-	if !rlResp.Success {
-		c.log.Info("⚠️ RL response not successful", "message", rlResp.Message)
+		logger.Error(err, "⚠️ Prometheus metrics failed (skip scaling)", "namespace", namespace, "deployment", name)
 		return nil
 	}
 
-	c.log.Info("🤖 RL Decision",
-		"action", rlResp.ActionName,
-		"confidence", fmt.Sprintf("%.2f%%", rlResp.Confidence*100),
-		"value", fmt.Sprintf("%.2f", rlResp.ValueEstimate),
-		"reward", fmt.Sprintf("%.2f", rlResp.Reward),
-		"buffer", rlResp.BufferSize,
-		"steps", rlResp.TrainingSteps,
-	)
+	vr := validator.Validate(m)
+	if !vr.Valid {
+		logger.Error(fmt.Errorf("%v", vr.Errors), "⚠️ Metrics invalid (skip scaling)", "namespace", namespace, "deployment", name)
+		return nil
+	}
+	m = validator.SanitizeMetrics(m)
+	hist.Add(m)
 
-	newReplicas := calculateNewReplicas(metrics.Replicas, rlResp.Action, c.cfg)
-	if newReplicas == metrics.Replicas {
-		c.log.Info("⏸️ No scaling needed", "action", rlResp.ActionName)
+	action, conf, actionName, err := callRL(ctx, cfg, httpClient, rlCB, namespace, name, m)
+	if err != nil {
+		logger.Error(err, "⚠️ RL agent call failed (fallback no_action)", "namespace", namespace, "deployment", name)
 		return nil
 	}
 
-	// safety
-	if c.cfg.SafetyEnabled {
-		allowed, reason := c.safety.CanScale(metrics.Replicas, newReplicas)
-		if !allowed {
-			c.log.Info("🛡️ Scaling blocked by safety controller", "reason", reason)
-			return nil
-		}
+	if conf < cfg.ConfidenceMin {
+		logger.V(1).Info("low confidence -> no_action", "namespace", namespace, "deployment", name, "confidence", conf, "min", cfg.ConfidenceMin)
+		return nil
 	}
 
-	if err := c.executeScaling(iterCtx, deploy, newReplicas); err != nil {
-		return fmt.Errorf("execute scaling: %w", err)
+	current := m.Replicas
+	desired := current
+	switch action {
+	case 0:
+		desired = current - cfg.MaxScaleStep
+	case 2:
+		desired = current + cfg.MaxScaleStep
+	default:
+		desired = current
 	}
 
-	c.safety.RecordScaling(metrics.Replicas, newReplicas, rlResp.ActionName, "rl_decision")
+	if desired < cfg.MinReplicas {
+		desired = cfg.MinReplicas
+	}
+	if desired > cfg.MaxReplicas {
+		desired = cfg.MaxReplicas
+	}
+	if desired == current {
+		return nil
+	}
 
-	c.log.Info("✅ Scaling Executed",
-		"from", metrics.Replicas,
-		"to", newReplicas,
-		"action", rlResp.ActionName,
-		"confidence", fmt.Sprintf("%.0f%%", rlResp.Confidence*100),
+	key := namespace + "/" + name
+	if !cd.CanScale(key, cfg.Cooldown) {
+		return nil
+	}
+
+	scaleCtx, cancel := context.WithTimeout(ctx, cfg.K8sTimeout)
+	defer cancel()
+
+	if err := scaler.ScaleDeployment(scaleCtx, namespace, name, desired); err != nil {
+		return fmt.Errorf("scale failed: %w", err)
+	}
+
+	cd.MarkScaled(key)
+
+	logger.Info("📈 Scaling applied",
+		"namespace", namespace,
+		"deployment", name,
+		"action", actionName,
+		"confidence", conf,
+		"from", current,
+		"to", desired,
 	)
 	return nil
 }
 
-// ======================== K8S CLIENT ========================
-
-func buildK8sClient(log logr.Logger) (*kubernetes.Clientset, error) {
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		kubeconfig := filepath.Join(homeDir(), ".kube", "config")
-		log.Info("⚙️ Using local kubeconfig", "path", kubeconfig)
-		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-		if err != nil {
-			return nil, fmt.Errorf("load kubeconfig: %w", err)
-		}
-	} else {
-		log.Info("🔗 Using in-cluster configuration")
-	}
-	return kubernetes.NewForConfig(config)
-}
-
-func homeDir() string {
-	if h := os.Getenv("HOME"); h != "" {
-		return h
-	}
-	if runtime.GOOS == "windows" {
-		return os.Getenv("USERPROFILE")
-	}
-	return ""
-}
-
-// ======================== METRICS ========================
-
-func (c *Controller) collectMetrics(ctx context.Context, deploy *appsv1.Deployment) (dto.Metrics, error) {
-	now := time.Now()
-
-	replicas := int32(1)
-	if deploy.Spec.Replicas != nil {
-		replicas = *deploy.Spec.Replicas
+func callRL(
+	ctx context.Context,
+	cfg config.Config,
+	httpClient *http.Client,
+	cb *CircuitBreaker,
+	namespace, deployment string,
+	m dto.Metrics,
+) (action int, confidence float64, actionName string, err error) {
+	if !cb.Allow() {
+		return 1, 0, "no_action", fmt.Errorf("circuit breaker open")
 	}
 
-	var metrics dto.Metrics
-
-	if c.cfg.MockMode {
-		metrics = generateMockMetrics(replicas)
-		c.log.Info("🎭 Using mock metrics")
-	} else {
-		// ✅ Don’t ignore errors; if Prom fails, return error and let reconcile fallback.
-		cpuUsage, err := c.queryPrometheus(ctx, fmt.Sprintf(
-			`avg(rate(container_cpu_usage_seconds_total{namespace="%s",pod=~"%s-.*"}[2m]))`,
-			c.cfg.Namespace, c.cfg.Deployment))
-		if err != nil {
-			return dto.Metrics{}, fmt.Errorf("prom cpu: %w", err)
-		}
-
-		memUsage, err := c.queryPrometheus(ctx, fmt.Sprintf(
-			`avg(container_memory_working_set_bytes{namespace="%s",pod=~"%s-.*"}) / (1024*1024*1024)`,
-			c.cfg.Namespace, c.cfg.Deployment))
-		if err != nil {
-			return dto.Metrics{}, fmt.Errorf("prom mem: %w", err)
-		}
-
-		requestRate, err := c.queryPrometheus(ctx, fmt.Sprintf(
-			`sum(rate(http_requests_total{namespace="%s",deployment="%s"}[2m]))`,
-			c.cfg.Namespace, c.cfg.Deployment))
-		if err != nil {
-			return dto.Metrics{}, fmt.Errorf("prom rps: %w", err)
-		}
-
-		latencyP95, err := c.queryPrometheus(ctx, fmt.Sprintf(
-			`histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{namespace="%s"}[2m]))`,
-			c.cfg.Namespace))
-		if err != nil {
-			return dto.Metrics{}, fmt.Errorf("prom p95: %w", err)
-		}
-
-		errorRate, err := c.queryPrometheus(ctx, fmt.Sprintf(
-			`sum(rate(http_requests_total{namespace="%s",status=~"5.."}[2m])) / sum(rate(http_requests_total{namespace="%s"}[2m]))`,
-			c.cfg.Namespace, c.cfg.Namespace))
-		if err != nil {
-			return dto.Metrics{}, fmt.Errorf("prom error_rate: %w", err)
-		}
-
-		metrics = dto.Metrics{
-			CPUUsage:    cpuUsage,
-			MemoryUsage: memUsage,
-			RequestRate: requestRate,
-			LatencyP95:  latencyP95,
-			ErrorRate:   errorRate,
-		}
-	}
-
-	// pod readiness/pending (best-effort)
-	pods, err := c.clientset.CoreV1().Pods(c.cfg.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("app=%s", c.cfg.Deployment),
-	})
-	pendingCount := int32(0)
-	readyCount := int32(0)
-	if err == nil {
-		for _, pod := range pods.Items {
-			switch pod.Status.Phase {
-			case "Pending":
-				pendingCount++
-			case "Running":
-				readyCount++
-			}
-		}
-	}
-
-	cpu1m, cpu5m, reqTrend := c.history.CalculateTrends()
-
-	hour := now.Hour()
-	dayOfWeek := int(now.Weekday())
-	isWeekend := dayOfWeek == 0 || dayOfWeek == 6
-	isPeakHour := hour >= 9 && hour <= 17 && !isWeekend
-
-	metrics.Replicas = replicas
-	metrics.PodPending = pendingCount
-	metrics.PodReady = readyCount
-	metrics.Timestamp = now.Unix()
-	metrics.CPUTrend1m = cpu1m
-	metrics.CPUTrend5m = cpu5m
-	metrics.RequestTrend = reqTrend
-	metrics.Hour = hour
-	metrics.DayOfWeek = dayOfWeek
-	metrics.IsWeekend = isWeekend
-	metrics.IsPeakHour = isPeakHour
-
-	if err := validateMetrics(metrics); err != nil {
-		c.log.Info("⚠️ Metrics validation warning", "error", err.Error())
-	}
-
-	return metrics, nil
-}
-
-func generateMockMetrics(replicas int32) dto.Metrics {
-	baseLoad := 0.5 + 0.3*math.Sin(float64(time.Now().Unix())/3600.0)
-
-	cpuUsage := baseLoad + (rand.Float64()-0.5)*0.1
-	cpuUsage = math.Max(0.1, math.Min(0.95, cpuUsage))
-
-	requestRate := 100.0 + 50.0*math.Sin(float64(time.Now().Unix())/1800.0)
-	requestRate = math.Max(10, requestRate)
-
-	latency := 0.2 + 0.3*cpuUsage
-	errorRate := 0.001
-	if cpuUsage > 0.8 {
-		errorRate = 0.01 * (cpuUsage - 0.8) / 0.2
-	}
-
-	readyCount := replicas
-	pendingCount := int32(0)
-	if rand.Float64() < 0.1 {
-		pendingCount = 1
-		if replicas > 0 {
-			readyCount = replicas - 1
-		}
-	}
-
-	return dto.Metrics{
-		CPUUsage:    cpuUsage,
-		MemoryUsage: 2.0 + rand.Float64()*0.5,
-		RequestRate: requestRate,
-		LatencyP95:  latency,
-		ErrorRate:   errorRate,
-		PodReady:    readyCount,
-		PodPending:  pendingCount,
-	}
-}
-
-func validateMetrics(m dto.Metrics) error {
-	if m.CPUUsage < 0 || m.CPUUsage > 1 {
-		return fmt.Errorf("invalid CPU: %.2f", m.CPUUsage)
-	}
-	if m.ErrorRate < 0 || m.ErrorRate > 1 {
-		return fmt.Errorf("invalid error rate: %.2f", m.ErrorRate)
-	}
-	return nil
-}
-
-// ======================== RL AGENT ========================
-
-func (c *Controller) queryRLAgent(ctx context.Context, metrics dto.Metrics) (*dto.RLResponse, error) {
-	reqData := dto.RLRequest{
-		DeploymentName: c.cfg.Deployment,
-		Namespace:      c.cfg.Namespace,
-		Metrics:        metrics,
-		TrainingMode:   c.cfg.TrainingMode,
+	reqBody := dto.RLRequest{
+		DeploymentName: deployment,
+		Namespace:      namespace,
+		Metrics:        m,
+		TrainingMode:   cfg.TrainingMode,
 		Timestamp:      time.Now().Unix(),
 	}
 
-	body, err := json.Marshal(reqData)
+	b, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("marshal rl request: %w", err)
+		cb.Fail()
+		return 1, 0, "no_action", fmt.Errorf("marshal rl request: %w", err)
 	}
 
-	u := c.cfg.RLAgentURL + "/predict"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("new request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.http.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("rl http do: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("rl non-200 status=%d body=%s", resp.StatusCode, string(b))
-	}
-
-	var out dto.RLResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("decode rl response: %w", err)
-	}
-	return &out, nil
-}
-
-// ======================== SCALING ========================
-
-func (c *Controller) executeScaling(ctx context.Context, deploy *appsv1.Deployment, newReplicas int32) error {
-	deploy.Spec.Replicas = &newReplicas
-
-	updated, err := c.clientset.AppsV1().Deployments(c.cfg.Namespace).Update(ctx, deploy, metav1.UpdateOptions{})
-	if err != nil {
-		return fmt.Errorf("deployment update: %w", err)
-	}
-	if updated.Spec.Replicas == nil || *updated.Spec.Replicas != newReplicas {
-		return fmt.Errorf("verification failed: expected %d got %v", newReplicas, updated.Spec.Replicas)
-	}
-	return nil
-}
-
-func calculateNewReplicas(current int32, action int, cfg dto.Config) int32 {
-	switch action {
-	case 0: // scale_down
-		if current > cfg.MinReplicas {
-			return current - 1
-		}
-	case 2: // scale_up
-		if current < cfg.MaxReplicas {
-			return current + 1
-		}
-	default: // 1 = no_action
-	}
-	return current
-}
-
-func (c *Controller) fallbackScaling(ctx context.Context, metrics dto.Metrics, deploy *appsv1.Deployment) error {
-	newReplicas := metrics.Replicas
-	reason := ""
-
-	if metrics.CPUUsage > 0.75 || metrics.LatencyP95 > 0.5 {
-		if metrics.Replicas < c.cfg.MaxReplicas {
-			newReplicas++
-			reason = "fallback_high_load"
-		}
-	} else if metrics.CPUUsage < 0.30 && metrics.LatencyP95 < 0.2 {
-		if metrics.Replicas > c.cfg.MinReplicas {
-			newReplicas--
-			reason = "fallback_low_load"
-		}
-	}
-
-	if newReplicas == metrics.Replicas {
-		return nil
-	}
-
-	if c.cfg.SafetyEnabled {
-		allowed, msg := c.safety.CanScale(metrics.Replicas, newReplicas)
-		if !allowed {
-			c.log.Info("🛡️ Fallback scaling blocked", "reason", msg)
-			return nil
-		}
-	}
-
-	if err := c.executeScaling(ctx, deploy, newReplicas); err != nil {
-		return err
-	}
-	c.safety.RecordScaling(metrics.Replicas, newReplicas, "fallback", reason)
-	c.log.Info("✅ Fallback scaling executed", "to", newReplicas, "reason", reason)
-	return nil
-}
-
-// ======================== PROMETHEUS ========================
-
-func (c *Controller) queryPrometheus(ctx context.Context, promQuery string) (float64, error) {
-	escaped := url.QueryEscape(promQuery)
-	fullURL := fmt.Sprintf("%s/api/v1/query?query=%s", c.cfg.PromURL, escaped)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
-	if err != nil {
-		return 0, fmt.Errorf("new prom request: %w", err)
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("prom http do: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return 0, fmt.Errorf("prom status=%d body=%s", resp.StatusCode, string(b))
-	}
-
-	var promResp dto.PrometheusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&promResp); err != nil {
-		return 0, fmt.Errorf("decode prom response: %w", err)
-	}
-
-	if len(promResp.Data.Result) == 0 {
-		return 0, nil
-	}
-
-	valueStr, ok := promResp.Data.Result[0].Value[1].(string)
-	if !ok {
-		return 0, fmt.Errorf("unexpected prom value format")
-	}
-
-	var v float64
-	if _, err := fmt.Sscanf(valueStr, "%f", &v); err != nil {
-		return 0, fmt.Errorf("parse prom float: %w", err)
-	}
-	return v, nil
-}
-
-func (c *Controller) testPrometheus() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_, err := c.queryPrometheus(ctx, "up")
-	if err != nil {
-		return err
-	}
-	c.log.Info("✅ Prometheus connection successful")
-	return nil
-}
-
-func (c *Controller) testRLAgent() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	rlCtx, cancel := context.WithTimeout(ctx, cfg.RLAgentTimeout)
 	defer cancel()
 
-	u := c.cfg.RLAgentURL + "/health"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	req, err := http.NewRequestWithContext(rlCtx, http.MethodPost, cfg.RLAgentURL+"/predict", bytes.NewReader(b))
 	if err != nil {
-		return err
+		cb.Fail()
+		return 1, 0, "no_action", fmt.Errorf("create rl request: %w", err)
 	}
-	resp, err := c.http.Do(req)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return err
+		cb.Fail()
+		return 1, 0, "no_action", fmt.Errorf("rl http error: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status %d", resp.StatusCode)
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		cb.Fail()
+		return 1, 0, "no_action", fmt.Errorf("rl status=%d body=%s", resp.StatusCode, string(body))
 	}
 
-	c.log.Info("✅ RL Agent connection successful")
-	return nil
+	var rr dto.RLResponse
+	if err := json.Unmarshal(body, &rr); err != nil {
+		cb.Fail()
+		return 1, 0, "no_action", fmt.Errorf("decode rl response: %w", err)
+	}
+	if !rr.Success {
+		cb.Fail()
+		return 1, 0, "no_action", fmt.Errorf("rl success=false: %s", rr.Message)
+	}
+
+	cb.Success()
+	return rr.Action, rr.Confidence, rr.ActionName, nil
 }
