@@ -95,7 +95,7 @@ func (hs *HistoryStore) Get(ns, name string) *metrics.History {
 }
 
 func main() {
-	zapLog, _ := zap.NewDevelopment()
+	zapLog, _ := zap.NewProduction()
 	logger := zapr.NewLogger(zapLog)
 
 	_ = godotenv.Load()
