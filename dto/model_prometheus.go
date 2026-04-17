@@ -5,10 +5,21 @@ import (
 	"time"
 )
 
+// type PrometheusResponse struct {
+// 	Status string `json:"status"`
+// 	Data   struct {
+// 		Result []struct {
+// 			Value []interface{} `json:"value"`
+// 		} `json:"result"`
+// 	} `json:"data"`
+// }
 type PrometheusResponse struct {
 	Status string `json:"status"`
 	Data   struct {
-		Result []struct {
+		ResultType string `json:"resultType"`
+		Result     []struct {
+			Metric map[string]string `json:"metric"`
+			// Value is [unixTimestamp, valueString].
 			Value []interface{} `json:"value"`
 		} `json:"result"`
 	} `json:"data"`
