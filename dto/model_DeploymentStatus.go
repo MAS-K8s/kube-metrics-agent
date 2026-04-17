@@ -11,6 +11,7 @@ type DeploymentStatus struct {
 	ReadyReplicas       int32  `json:"readyReplicas"`
 }
 
+
 // IsHealthy returns true if the deployment has reached the desired replicas
 // and has no unavailable replicas.
 func (ds DeploymentStatus) IsHealthy() bool {

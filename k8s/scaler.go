@@ -88,6 +88,10 @@ func (s *Scaler) GetDeploymentStatus(ctx context.Context, namespace, name string
 }
 
 func (s *Scaler) ScaleDeployment(ctx context.Context, namespace, name string, desired int32) error {
+	if desired < 1 {
+		return fmt.Errorf("refusing to scale %s/%s to %d: minimum allowed is 1", namespace, name, desired)
+	}
+
 	backoff := wait.Backoff{
 		Steps:    4,
 		Duration: 150 * time.Millisecond,
