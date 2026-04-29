@@ -23,7 +23,6 @@ ARG TARGETARCH=amd64
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w" -o /out/rl-controller ./
 
-
 ############################
 # Runtime stage (lightweight)
 ############################

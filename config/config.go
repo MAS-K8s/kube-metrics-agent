@@ -49,7 +49,7 @@ type Config struct {
 	MaxConcurrent int
 }
 
-// Load is “production first”:
+// Load is "production first":
 // - env vars are the main config (K8s style)
 // - flags exist ONLY to override for local dev
 func Load() (Config, error) {
@@ -87,7 +87,7 @@ func Load() (Config, error) {
 	}
 
 	// Optional: allow CLI overrides (local dev)
-	// In Kubernetes you normally won’t pass flags, so this won’t conflict.
+	// In Kubernetes you normally won't pass flags, so this won't conflict.
 	applyFlagOverrides(&cfg)
 
 	if err := validate(cfg); err != nil {
@@ -97,72 +97,78 @@ func Load() (Config, error) {
 }
 
 func applyFlagOverrides(cfg *Config) {
-	// NOTE: only use these when you intentionally pass flags.
+	// Use a fresh FlagSet each call so repeated Load() calls in tests
+	// never hit "flag redefined" panics on the global CommandLine.
+	fs := flag.NewFlagSet("config", flag.ContinueOnError)
+
 	var (
-		ns          = flag.String("namespace", "", "Override namespace (empty=all)")
-		selector    = flag.String("selector", "", "Override label selector")
-		prom        = flag.String("prometheus", "", "Override Prometheus URL")
-		rl          = flag.String("rl-agent", "", "Override RL Agent URL")
-		intervalStr = flag.String("interval", "", "Override interval, e.g. 30s")
+		ns          = fs.String("namespace", "", "Override namespace (empty=all)")
+		selector    = fs.String("selector", "", "Override label selector")
+		prom        = fs.String("prometheus", "", "Override Prometheus URL")
+		rl          = fs.String("rl-agent", "", "Override RL Agent URL")
+		intervalStr = fs.String("interval", "", "Override interval, e.g. 30s")
 
-		minRep  = flag.Int("min-replicas", -1, "Override min replicas")
-		maxRep  = flag.Int("max-replicas", -1, "Override max replicas")
-		step    = flag.Int("max-scale-step", -1, "Override max scale step")
-		coolStr = flag.String("cooldown", "", "Override cooldown, e.g. 60s")
+		minRep  = fs.Int("min-replicas", -1, "Override min replicas")
+		maxRep  = fs.Int("max-replicas", -1, "Override max replicas")
+		step    = fs.Int("max-scale-step", -1, "Override max scale step")
+		coolStr = fs.String("cooldown", "", "Override cooldown, e.g. 60s")
 
-		conf = flag.Float64("confidence-min", -1, "Override confidence min 0..1")
-		mock = flag.Bool("mock", cfg.MockMode, "Override mock mode")
-		train = flag.Bool("training", cfg.TrainingMode, "Override training mode")
+		conf  = fs.Float64("confidence-min", -1, "Override confidence min 0..1")
+		mock  = fs.Bool("mock", cfg.MockMode, "Override mock mode")
+		train = fs.Bool("training", cfg.TrainingMode, "Override training mode")
 	)
 
-	flag.Parse()
+	// Ignore parse errors: unknown flags from `go test` (e.g. -test.v) are fine.
+	fs.Parse(os.Args[1:]) //nolint:errcheck
 
-	if *ns != "" || flag.Lookup("namespace").Value.String() == "" {
-		// If user passed -namespace explicitly (even empty), accept it:
-		if flagIsSet("namespace") {
+	// fs.Visit only iterates flags that were explicitly set on the CLI,
+	// so we never accidentally overwrite env-sourced values.
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "namespace":
 			cfg.Namespace = *ns
+		case "selector":
+			if *selector != "" {
+				cfg.LabelSelector = *selector
+			}
+		case "prometheus":
+			if *prom != "" {
+				cfg.PrometheusURL = *prom
+			}
+		case "rl-agent":
+			if *rl != "" {
+				cfg.RLAgentURL = *rl
+			}
+		case "interval":
+			if *intervalStr != "" {
+				cfg.Interval = mustDuration(*intervalStr)
+			}
+		case "min-replicas":
+			if *minRep >= 0 {
+				cfg.MinReplicas = int32(*minRep)
+			}
+		case "max-replicas":
+			if *maxRep >= 0 {
+				cfg.MaxReplicas = int32(*maxRep)
+			}
+		case "max-scale-step":
+			if *step >= 0 {
+				cfg.MaxScaleStep = int32(*step)
+			}
+		case "cooldown":
+			if *coolStr != "" {
+				cfg.Cooldown = mustDuration(*coolStr)
+			}
+		case "confidence-min":
+			if *conf >= 0 {
+				cfg.ConfidenceMin = *conf
+			}
+		case "mock":
+			cfg.MockMode = *mock
+		case "training":
+			cfg.TrainingMode = *train
 		}
-	}
-	if flagIsSet("selector") && *selector != "" {
-		cfg.LabelSelector = *selector
-	}
-	if flagIsSet("prometheus") && *prom != "" {
-		cfg.PrometheusURL = *prom
-	}
-	if flagIsSet("rl-agent") && *rl != "" {
-		cfg.RLAgentURL = *rl
-	}
-	if flagIsSet("interval") && *intervalStr != "" {
-		cfg.Interval = mustDuration(*intervalStr)
-	}
-	if flagIsSet("min-replicas") && *minRep >= 0 {
-		cfg.MinReplicas = int32(*minRep)
-	}
-	if flagIsSet("max-replicas") && *maxRep >= 0 {
-		cfg.MaxReplicas = int32(*maxRep)
-	}
-	if flagIsSet("max-scale-step") && *step >= 0 {
-		cfg.MaxScaleStep = int32(*step)
-	}
-	if flagIsSet("cooldown") && *coolStr != "" {
-		cfg.Cooldown = mustDuration(*coolStr)
-	}
-	if flagIsSet("confidence-min") && *conf >= 0 {
-		cfg.ConfidenceMin = *conf
-	}
-
-	// bool flags always have a value, so we only set if flag explicitly provided
-	if flagIsSet("mock") {
-		cfg.MockMode = *mock
-	}
-	if flagIsSet("training") {
-		cfg.TrainingMode = *train
-	}
-}
-
-func flagIsSet(name string) bool {
-	f := flag.Lookup(name)
-	return f != nil && f.Value.String() != f.DefValue
+	})
 }
 
 func validate(c Config) error {

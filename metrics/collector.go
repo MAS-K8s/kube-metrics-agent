@@ -157,17 +157,11 @@ type queryResult struct {
 // Running queries concurrently reduces collection time from ~81s (sequential)
 // to ~10s, preventing context deadline exceeded cascades.
 func (c *Collector) collectRealMetrics(ctx context.Context, namespace, deployment string) (Metrics, error) {
-	// BUG 1 FIX: podRegex was used throughout the queries map but was never
-	// declared anywhere in the function, causing a compile error
-	// ("undefined: podRegex"). Must be defined before the queries map.
+	
 	podRegex := deployment + "-[a-zA-Z0-9]+-[a-zA-Z0-9]+"
 
 	queries := map[string]string{
-		// BUG 2 FIX: cpu="total" is not a real cAdvisor label — it caused both
-		// the cpu and cpu_throttle queries to always return empty results,
-		// making CPU read as 0 every cycle regardless of actual load.
-		// Correct approach: filter out the pause/POD infrastructure containers
-		// using container!="POD",container!="".
+		
 		"cpu": fmt.Sprintf(
 			`avg(rate(container_cpu_usage_seconds_total{namespace=%q,pod=~%q,container!="POD",container!=""}[2m]))`,
 			namespace, podRegex,
@@ -252,9 +246,7 @@ func (c *Collector) collectRealMetrics(ctx context.Context, namespace, deploymen
 		)
 	}
 
-	// BUG 3 FIX: out := Metrics{} was declared twice consecutively, which is
-	// a compile error in Go ("no new variables on left side of :=").
-	// Removed the duplicate declaration — only one is needed.
+	
 	out := Metrics{}
 
 	// ── Direct assignments ────────────────────────────────────────────
