@@ -496,7 +496,6 @@ func (c *Collector) generateMockMetrics(replicas int32) Metrics {
 	}
 }
 
-// BUG 4 FIX: sanitizeFloat was missing its closing brace }, making the entire
 // file syntactically invalid and uncompilable.
 func sanitizeFloat(v float64) float64 {
 	if math.IsNaN(v) || math.IsInf(v, 0) {

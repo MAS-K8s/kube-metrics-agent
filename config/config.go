@@ -47,6 +47,22 @@ type Config struct {
 
 	// Concurrency
 	MaxConcurrent int
+
+	// Fallback rule-based scaler
+	// Enabled automatically when the RL agent is unavailable; can also be
+	// forced on with FALLBACK_ENABLED=true to run rule-based-only mode.
+	FallbackEnabled bool
+
+	// Scale-up thresholds (any one exceeded → scale_up)
+	FallbackScaleUpCPU     float64 // FALLBACK_SCALEUP_CPU     (default 0.75)
+	FallbackScaleUpLatency float64 // FALLBACK_SCALEUP_LATENCY (default 0.50 s)
+	FallbackScaleUpError   float64 // FALLBACK_SCALEUP_ERROR   (default 0.05)
+	FallbackScaleUpReqRate float64 // FALLBACK_SCALEUP_REQRATE (default 100.0, 0=disabled)
+
+	// Scale-down thresholds (all must be below → scale_down)
+	FallbackScaleDownCPU     float64 // FALLBACK_SCALEDOWN_CPU     (default 0.20)
+	FallbackScaleDownLatency float64 // FALLBACK_SCALEDOWN_LATENCY (default 0.10 s)
+	FallbackScaleDownError   float64 // FALLBACK_SCALEDOWN_ERROR   (default 0.01)
 }
 
 // Load is "production first":
@@ -84,6 +100,18 @@ func Load() (Config, error) {
 		CBOpenDuration:     mustDuration(getenv("CB_OPEN_DURATION", "30s")),
 
 		MaxConcurrent: mustInt(getenv("MAX_CONCURRENT", "4")),
+
+		// Fallback rule-based scaler
+		FallbackEnabled: mustBool(getenv("FALLBACK_ENABLED", "true")),
+
+		FallbackScaleUpCPU:     mustFloat(getenv("FALLBACK_SCALEUP_CPU", "0.75")),
+		FallbackScaleUpLatency: mustFloat(getenv("FALLBACK_SCALEUP_LATENCY", "0.50")),
+		FallbackScaleUpError:   mustFloat(getenv("FALLBACK_SCALEUP_ERROR", "0.05")),
+		FallbackScaleUpReqRate: mustFloat(getenv("FALLBACK_SCALEUP_REQRATE", "100.0")),
+
+		FallbackScaleDownCPU:     mustFloat(getenv("FALLBACK_SCALEDOWN_CPU", "0.20")),
+		FallbackScaleDownLatency: mustFloat(getenv("FALLBACK_SCALEDOWN_LATENCY", "0.10")),
+		FallbackScaleDownError:   mustFloat(getenv("FALLBACK_SCALEDOWN_ERROR", "0.01")),
 	}
 
 	// Optional: allow CLI overrides (local dev)
