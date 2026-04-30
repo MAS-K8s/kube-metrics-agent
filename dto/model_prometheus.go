@@ -5,14 +5,7 @@ import (
 	"time"
 )
 
-// type PrometheusResponse struct {
-// 	Status string `json:"status"`
-// 	Data   struct {
-// 		Result []struct {
-// 			Value []interface{} `json:"value"`
-// 		} `json:"result"`
-// 	} `json:"data"`
-// }
+
 type PrometheusResponse struct {
 	Status string `json:"status"`
 	Data   struct {
