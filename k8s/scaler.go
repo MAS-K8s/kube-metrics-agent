@@ -26,7 +26,7 @@ func NewScaler(clientset *kubernetes.Clientset, logger logr.Logger) *Scaler {
 	return &Scaler{clientset: clientset, logger: logger}
 }
 
-// ✅ Allows main.go to pass clientset into collector
+// Allows main.go to pass clientset into collector
 func (s *Scaler) Clientset() *kubernetes.Clientset {
 	return s.clientset
 }

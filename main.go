@@ -7,6 +7,10 @@
 //  4. Applies the returned scaling action (scale_up / no_action / scale_down)
 //     subject to confidence gating, cooldown enforcement, and min/max bounds.
 //
+// When the RL agent is unreachable or the circuit breaker is open, the
+// controller falls back to a rule-based scaler (see metrics/fallback.go)
+// rather than silently doing nothing.
+//
 // All runtime configuration is read from environment variables (see config.go).
 // The controller performs a warm-up sequence on startup to ensure both the
 // Kubernetes API server and the RL agent are healthy before the first cycle.
@@ -37,7 +41,8 @@ import (
 	"go.uber.org/zap"
 )
 
-
+// cooldownTracker enforces a minimum interval between consecutive scaling
+// actions on the same deployment, preventing rapid flapping.
 type cooldownTracker struct {
 	mu         sync.Mutex
 	lastScaled map[string]time.Time
@@ -49,7 +54,8 @@ func newCooldownTracker() *cooldownTracker {
 	}
 }
 
-
+// CanScale returns true if at least cooldown time has elapsed since the last
+// scaling action for key, or if key has never been scaled.
 func (ct *cooldownTracker) CanScale(key string, cooldown time.Duration) bool {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
@@ -67,7 +73,6 @@ func (ct *cooldownTracker) MarkScaled(key string) {
 	defer ct.mu.Unlock()
 	ct.lastScaled[key] = time.Now()
 }
-
 
 // historyStore owns one metrics.History ring buffer per managed deployment.
 // Buffers are created lazily on first access and are safe for concurrent use.
@@ -95,7 +100,6 @@ func (hs *historyStore) Get(namespace, name string) *metrics.History {
 	hs.data[key] = h
 	return h
 }
-
 
 func main() {
 	// Structured logger — production JSON format written to stdout.
@@ -141,6 +145,13 @@ func main() {
 		"maxScaleStep", cfg.MaxScaleStep,
 		"cooldown", cfg.Cooldown,
 		"confidenceMin", cfg.ConfidenceMin,
+		"fallbackEnabled", cfg.FallbackEnabled,
+		"fallbackScaleUpCPU", cfg.FallbackScaleUpCPU,
+		"fallbackScaleUpLatency", cfg.FallbackScaleUpLatency,
+		"fallbackScaleUpError", cfg.FallbackScaleUpError,
+		"fallbackScaleDownCPU", cfg.FallbackScaleDownCPU,
+		"fallbackScaleDownLatency", cfg.FallbackScaleDownLatency,
+		"fallbackScaleDownError", cfg.FallbackScaleDownError,
 	)
 
 	// Build and verify Kubernetes client.
@@ -155,12 +166,23 @@ func main() {
 	}
 
 	// Initialise shared infrastructure components.
-	scaler      := k8s.NewScaler(clientset, logger)
-	validator   := metrics.NewValidator()
-	history     := newHistoryStore()
-	cooldown    := newCooldownTracker()
-	rlBreaker   := circuit.New(cfg.CBFailureThreshold, cfg.CBOpenDuration)
-	sem         := make(chan struct{}, cfg.MaxConcurrent)
+	scaler    := k8s.NewScaler(clientset, logger)
+	validator := metrics.NewValidator()
+	history   := newHistoryStore()
+	cooldown  := newCooldownTracker()
+	rlBreaker := circuit.New(cfg.CBFailureThreshold, cfg.CBOpenDuration)
+	sem       := make(chan struct{}, cfg.MaxConcurrent)
+
+	// Build the rule-based fallback scaler from config thresholds.
+	fallbackScaler := metrics.NewRuleBasedScaler(metrics.FallbackConfig{
+		ScaleUpCPUThreshold:     cfg.FallbackScaleUpCPU,
+		ScaleUpLatencyThreshold: cfg.FallbackScaleUpLatency,
+		ScaleUpErrorThreshold:   cfg.FallbackScaleUpError,
+		ScaleUpRequestThreshold: cfg.FallbackScaleUpReqRate,
+		ScaleDownCPUThreshold:   cfg.FallbackScaleDownCPU,
+		ScaleDownLatencyThreshold: cfg.FallbackScaleDownLatency,
+		ScaleDownErrorThreshold:   cfg.FallbackScaleDownError,
+	})
 
 	// The HTTP client's hard timeout is intentionally set to 3× RLAgentTimeout.
 	// Per-request deadlines are controlled by context cancellation inside
@@ -186,7 +208,7 @@ func main() {
 
 	// Run an initial reconciliation cycle immediately so the first scaling
 	// decision is not delayed by the full ticker interval.
-	if err := reconcileAll(ctx, cfg, logger, scaler, collector, validator, history, httpClient, rlBreaker, cooldown, sem); err != nil {
+	if err := reconcileAll(ctx, cfg, logger, scaler, collector, validator, history, httpClient, rlBreaker, fallbackScaler, cooldown, sem); err != nil {
 		logger.Error(err, "initial reconciliation cycle failed")
 	}
 
@@ -199,19 +221,21 @@ func main() {
 			logger.Info("shutdown signal received — controller stopping")
 			return
 		case <-ticker.C:
-			if err := reconcileAll(ctx, cfg, logger, scaler, collector, validator, history, httpClient, rlBreaker, cooldown, sem); err != nil {
+			if err := reconcileAll(ctx, cfg, logger, scaler, collector, validator, history, httpClient, rlBreaker, fallbackScaler, cooldown, sem); err != nil {
 				logger.Error(err, "reconciliation cycle failed")
 			}
 		}
 	}
 }
 
-
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
 
 // runStartupChecks verifies that the RL agent service and Prometheus are
 // reachable before the first reconciliation cycle. A failure here is logged
-// but does not prevent the controller from starting; the circuit breaker will
-// handle subsequent failures gracefully.
+// but does not prevent the controller from starting; the fallback scaler will
+// handle decisions until the RL agent recovers.
 func runStartupChecks(
 	ctx context.Context,
 	cfg config.Config,
@@ -220,7 +244,7 @@ func runStartupChecks(
 	collector *metrics.Collector,
 ) {
 	if err := checkRLHealth(ctx, cfg, httpClient); err != nil {
-		logger.Error(err, "RL agent health check failed — will retry on first cycle")
+		logger.Error(err, "RL agent health check failed — fallback scaler will be used until agent recovers")
 	} else {
 		logger.Info("RL agent health check passed")
 		warmupRLAgent(ctx, cfg, logger, httpClient)
@@ -237,7 +261,8 @@ func runStartupChecks(
 	}
 }
 
-
+// warmupRLAgent sends a synthetic /predict request to force PyTorch model
+// initialisation before the first live cycle.
 // The warmup is retried up to maxWarmupAttempts times with a 2-second backoff.
 func warmupRLAgent(ctx context.Context, cfg config.Config, logger logr.Logger, httpClient *http.Client) {
 	const (
@@ -331,6 +356,7 @@ func reconcileAll(
 	history *historyStore,
 	httpClient *http.Client,
 	rlBreaker *circuit.Breaker,
+	fallbackScaler *metrics.RuleBasedScaler,
 	cooldown *cooldownTracker,
 	sem chan struct{},
 ) error {
@@ -382,7 +408,7 @@ func reconcileAll(
 			rCtx, cancel := context.WithTimeout(ctx, cfg.Interval)
 			defer cancel()
 
-			if err := reconcileOne(rCtx, cfg, logger, scaler, collector, validator, history, httpClient, rlBreaker, cooldown, dep.Namespace, dep.Name); err != nil {
+			if err := reconcileOne(rCtx, cfg, logger, scaler, collector, validator, history, httpClient, rlBreaker, fallbackScaler, cooldown, dep.Namespace, dep.Name); err != nil {
 				errCh <- fmt.Errorf("%s/%s: %w", dep.Namespace, dep.Name, err)
 			}
 		}()
@@ -404,7 +430,9 @@ func reconcileAll(
 // reconcileOne executes a single reconciliation cycle for one deployment:
 //  1. Fetch current deployment state from the Kubernetes API.
 //  2. Collect and validate Prometheus metrics.
-//  3. Forward metrics to the RL agent and receive a scaling decision.
+//  3. Attempt to get a scaling decision from the RL agent.
+//     If the RL agent is unavailable AND cfg.FallbackEnabled is true,
+//     the rule-based fallback scaler is consulted instead.
 //  4. Apply the decision subject to confidence gating, cooldown, and bounds.
 func reconcileOne(
 	ctx context.Context,
@@ -416,6 +444,7 @@ func reconcileOne(
 	history *historyStore,
 	httpClient *http.Client,
 	rlBreaker *circuit.Breaker,
+	fallbackScaler *metrics.RuleBasedScaler,
 	cooldown *cooldownTracker,
 	namespace, name string,
 ) error {
@@ -458,33 +487,72 @@ func reconcileOne(
 		"cpuTrend1m", m.CPUTrend1m,
 	)
 
-	// Step 3: Call RL agent for a scaling decision.
-	decision, err := callRLAgent(ctx, cfg, httpClient, rlBreaker, namespace, name, m, logger)
-	if err != nil {
-		logger.Error(err, "RL agent call failed — defaulting to no_action",
+	// Step 3: Obtain a scaling decision.
+	//
+	// Primary path: RL agent.
+	// Fallback path: rule-based scaler, used when:
+	//   (a) the RL agent call fails for any reason (network error, timeout,
+	//       non-2xx response, bad JSON, success=false), OR
+	//   (b) the circuit breaker is open (rlBreaker.Allow() == false).
+	// The fallback is only activated when cfg.FallbackEnabled is true;
+	// otherwise the original no-op behaviour is preserved.
+	var (
+		action     int
+		actionName string
+		confidence float64
+		usingFallback bool
+	)
+
+	rlDecision, rlErr := callRLAgent(ctx, cfg, httpClient, rlBreaker, namespace, name, m, logger)
+	if rlErr != nil {
+		logger.Error(rlErr, "RL agent call failed",
 			"namespace", namespace, "deployment", name)
-		return nil
+
+		if !cfg.FallbackEnabled {
+			logger.Info("fallback disabled — defaulting to no_action",
+				"namespace", namespace, "deployment", name)
+			return nil
+		}
+
+		// Invoke the rule-based fallback scaler.
+		fb := fallbackScaler.Decide(m)
+		action = fb.Action
+		actionName = fb.ActionName
+		confidence = fb.Confidence
+		usingFallback = true
+
+		logger.Info("rule-based fallback decision",
+			"namespace", namespace, "deployment", name,
+			"action", fb.ActionName,
+			"reason", fb.Reason,
+		)
+	} else {
+		action = rlDecision.Action
+		actionName = rlDecision.ActionName
+		confidence = rlDecision.Confidence
 	}
 
-	// Step 4a: Confidence gate — reject decisions below the minimum threshold.
-	if decision.Confidence < cfg.ConfidenceMin {
+	// Step 4a: Confidence gate.
+	// Fallback decisions carry confidence=1.0 and always pass this check;
+	// the gate is meaningful only for probabilistic RL outputs.
+	if confidence < cfg.ConfidenceMin {
 		logger.Info("action rejected: confidence below minimum threshold",
 			"namespace", namespace, "deployment", name,
-			"action", decision.ActionName,
-			"confidence", decision.Confidence,
+			"action", actionName,
+			"confidence", confidence,
 			"confidenceMin", cfg.ConfidenceMin,
 		)
 		return nil
 	}
 
 	current := m.Replicas
-	action := decision.Action
 
 	// Step 4b: Minimum-replica guard — never scale below cfg.MinReplicas.
-	if action == 0 && current <= cfg.MinReplicas {
+	if action == metrics.FallbackActionScaleDown && current <= cfg.MinReplicas {
 		logger.Info("action rejected: deployment already at minimum replica count",
 			"namespace", namespace, "deployment", name,
 			"current", current, "minReplicas", cfg.MinReplicas,
+			"usingFallback", usingFallback,
 		)
 		return nil
 	}
@@ -495,8 +563,9 @@ func reconcileOne(
 	if desired == current {
 		logger.Info("no replica change required",
 			"namespace", namespace, "deployment", name,
-			"current", current, "action", decision.ActionName,
-			"confidence", decision.Confidence,
+			"current", current, "action", actionName,
+			"confidence", confidence,
+			"usingFallback", usingFallback,
 		)
 		return nil
 	}
@@ -507,6 +576,7 @@ func reconcileOne(
 		logger.Info("action suppressed: cooldown period active",
 			"namespace", namespace, "deployment", name,
 			"cooldown", cfg.Cooldown,
+			"usingFallback", usingFallback,
 		)
 		return nil
 	}
@@ -523,15 +593,16 @@ func reconcileOne(
 
 	logger.Info("scaling action applied",
 		"namespace", namespace, "deployment", name,
-		"action", decision.ActionName,
-		"confidence", decision.Confidence,
+		"action", actionName,
+		"confidence", confidence,
 		"from", current, "to", desired,
+		"usingFallback", usingFallback,
 	)
 
 	return nil
 }
 
-// computeDesired translates a discrete RL action into a target replica count,
+// computeDesired translates a discrete action into a target replica count,
 // applying MaxScaleStep and the configured min/max bounds.
 //
 //	action 0 = scale_down → current - MaxScaleStep
@@ -540,9 +611,9 @@ func reconcileOne(
 func computeDesired(current int32, action int, cfg config.Config) int32 {
 	var desired int32
 	switch action {
-	case 0:
+	case metrics.FallbackActionScaleDown:
 		desired = current - cfg.MaxScaleStep
-	case 2:
+	case metrics.FallbackActionScaleUp:
 		desired = current + cfg.MaxScaleStep
 	default:
 		desired = current
@@ -565,7 +636,7 @@ func computeDesired(current int32, action int, cfg config.Config) int32 {
 //
 // The circuit breaker is consulted before each request and updated on every
 // outcome. When the circuit is open, callRLAgent returns immediately with an
-// error so the controller falls back to no_action without blocking.
+// error so reconcileOne can invoke the fallback scaler.
 func callRLAgent(
 	ctx context.Context,
 	cfg config.Config,
@@ -576,7 +647,7 @@ func callRLAgent(
 	logger logr.Logger,
 ) (*dto.RLResponse, error) {
 	if !cb.Allow() {
-		return nil, fmt.Errorf("RL agent circuit breaker is open — skipping request")
+		return nil, fmt.Errorf("RL agent circuit breaker is open — falling back to rule-based scaler")
 	}
 
 	reqBody := dto.RLRequest{
